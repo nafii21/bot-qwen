@@ -1,7 +1,9 @@
-import os, requests
+import os
+import requests
 
 def summarize(ctx, setup):
     api_key = os.environ["GROQ_API_KEY"]
+    # Pastikan URL ini PERSIS sama
     url = "https://api.groq.com/openai/v1/chat/completions"
 
     prompt = f"""Kamu asisten trading US100. Rangkum kondisi market dalam 2-3 kalimat bahasa Indonesia santai.
@@ -22,6 +24,7 @@ Setup: {setup['text']}
 Cukup jelaskan kenapa setup ini valid atau tidak. Maksimal 3 kalimat."""
 
     payload = {
+        # Ganti model di sini kalau perlu, tapi ini yang paling stabil
         "model": "openai/gpt-oss-120b",
         "messages": [
             {"role": "system", "content": "Kamu asisten trading yang ringkas dan tidak mengarang data."},
@@ -41,4 +44,8 @@ Cukup jelaskan kenapa setup ini valid atau tidak. Maksimal 3 kalimat."""
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return f"(LLM error: {e})"
+        # Cetak error yang lebih detail untuk debugging
+        print(f"LLM error: {e}")
+        if 'r' in locals():
+            print(f"Response body: {r.text}")
+        return "(LLM error)"
