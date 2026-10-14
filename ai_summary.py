@@ -22,7 +22,7 @@ Setup: {setup['text']}
 Cukup jelaskan kenapa setup ini valid atau tidak. Maksimal 3 kalimat."""
 
     payload = {
-        "model": "llama-3.3-70b-versatile",
+        "model": "openai/gpt-oss-120b",
         "messages": [
             {"role": "system", "content": "Kamu asisten trading yang ringkas dan tidak mengarang data."},
             {"role": "user", "content": prompt}
