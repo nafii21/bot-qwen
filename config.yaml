@@ -1,1 +1,21 @@
+symbol_data: "^NDX"
+macro_tickers:
+  vix: "^VIX"
+  dxy: "DX-Y.NYB"
+  tnx: "^TNX"
 
+strategy:
+  ema_fast: 20
+  ema_slow: 50
+  ema_trend: 200
+  rsi_period: 14
+  atr_period: 14
+  adx_period: 14
+  adx_trend_threshold: 20
+
+risk:
+  per_trade_pct: 0.5
+
+# Isi manual tanggal high impact (format YYYY-MM-DD)
+high_impact_days:
+  - "2025-11-12"  # contoh CPI
