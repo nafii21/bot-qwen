@@ -1,6 +1,6 @@
-yfinance
-pandas
-numpy
-requests
-pyyaml
-pytz
+yfinance>=0.2.50
+pandas>=2.2.3
+numpy>=2.0.0
+requests>=2.32.3
+pyyaml>=6.0.2
+pytz>=2024.2
