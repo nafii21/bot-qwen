@@ -1,21 +1,28 @@
 symbol_data: "^NDX"
-macro_tickers:
-  vix: "^VIX"
-  dxy: "DX-Y.NYB"
-  tnx: "^TNX"
 
+# ==== EQUITY & RISK ====
+equity: 1000          # USD
+risk_pct: 0.5         # % per trade
+
+# ==== STRATEGI M15 ====
 strategy:
   ema_fast: 20
   ema_slow: 50
-  ema_trend: 200
-  rsi_period: 14
   atr_period: 14
   adx_period: 14
-  adx_trend_threshold: 20
+  adx_min: 20
+  rr_target: 1.5
+  swing_lookback: 30      # candle untuk cari swing high/low
+  max_dist_from_ema_atr: 1.5
 
-risk:
-  per_trade_pct: 0.5
+# ==== FIBONACCI ====
+fib:
+  enabled: true
+  golden_low: 0.5
+  golden_high: 0.618
 
-# Isi manual tanggal high impact (format YYYY-MM-DD)
-high_impact_days:
-  - "2025-11-12"  # contoh CPI
+# ==== NEWS FILTER ====
+news:
+  enabled: true
+  minutes_before: 30
+  minutes_after: 30
