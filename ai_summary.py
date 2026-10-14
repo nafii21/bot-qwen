@@ -1,8 +1,8 @@
-import os, requests, json
+import os, requests
 
 def summarize(ctx, setup):
-    api_key = os.environ["GEMINI_API_KEY"]
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+    api_key = os.environ["GROQ_API_KEY"]
+    url = "https://api.groq.com/openai/v1/chat/completions"
 
     prompt = f"""Kamu asisten trading US100. Rangkum kondisi market dalam 2-3 kalimat bahasa Indonesia santai.
 JANGAN mengarang angka. Pakai HANYA data berikut:
@@ -21,10 +21,24 @@ Setup: {setup['text']}
 
 Cukup jelaskan kenapa setup ini valid atau tidak. Maksimal 3 kalimat."""
 
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
+    payload = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": "Kamu asisten trading yang ringkas dan tidak mengarang data."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 300,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
     try:
-        r = requests.post(url, json=payload, timeout=30)
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
         r.raise_for_status()
-        return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
         return f"(LLM error: {e})"
