@@ -2,44 +2,21 @@ name: us100-playbook
 
 on:
   schedule:
-    # 00:00 UTC = 07:00 WIB (playbook pagi)
-    - cron: '0 0 * * 1-5'
-    # 08:30 UTC = 15:30 WIB (update ORB)
-    - cron: '30 8 * * 1-5'
+    - cron: "0 0 * * 1-5"
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'morning / orb'
-        default: 'morning'
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Install deps
-        run: pip install -r requirements.txt
-
-      - name: Pick mode
-        id: pick
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.schedule }}" = "0 0 * * 1-5" ]; then
-            echo "mode=morning" >> $GITHUB_OUTPUT
-          else
-            echo "mode=orb" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Run bot
-        run: python main.py
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python main.py
         env:
-          MODE: ${{ steps.pick.outputs.mode }}
+          MODE: morning
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
