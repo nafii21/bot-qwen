@@ -1,6 +1,0 @@
-python-telegram-bot
-yfinance
-pandas
-pandas-ta
-groq
-pytz
