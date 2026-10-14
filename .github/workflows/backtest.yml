@@ -1,31 +1,290 @@
-name: us100-backtest-m15
+import os
+import requests
+import yfinance as yf
+import pandas as pd
+import numpy as np
 
-on:
-  workflow_dispatch:
+# ============ CONFIG ============
+SPREAD_POINTS = float(os.getenv("BT_SPREAD", "2.0"))
+SLIPPAGE_POINTS = float(os.getenv("BT_SLIPPAGE", "1.0"))
+RISK_PCT = float(os.getenv("BT_RISK", "0.5"))
+INITIAL_EQUITY = float(os.getenv("BT_EQUITY", "1000"))
+RR_TARGET = float(os.getenv("BT_RR", "1.5"))
 
-jobs:
-  backtest:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - name: Run backtest
-        run: python backtest.py
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          BT_SPREAD: "2.0"
-          BT_SLIPPAGE: "1.0"
-          BT_RISK: "0.5"
-          BT_EQUITY: "1000"
+EMA_FAST = 20
+EMA_SLOW = 50
+ATR_PERIOD = 14
+ADX_PERIOD = 14
+ADX_MIN = 25              # ← naik dari 20
+SWING_LOOKBACK = 30
+MAX_DIST_ATR = 1.0        # ← turun dari 1.5
+MAX_HOLD_CANDLES = 16     # ← turun dari 32
+COST = SPREAD_POINTS + SLIPPAGE_POINTS
 
-      - name: Upload CSV
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-trades
-          path: backtest_m15.csv
-          if-no-files-found: ignore
+# ============ INDIKATOR ============
+def ema(s, n): return s.ewm(span=n, adjust=False).mean()
+
+def atr(df, n=14):
+    h, l, c = df["High"], df["Low"], df["Close"]
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
+
+def adx(df, n=14):
+    h, l, c = df["High"], df["Low"], df["Close"]
+    up = h.diff(); dn = -l.diff()
+    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    atr_ = tr.rolling(n).mean()
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(n).mean() / atr_
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(n).mean() / atr_
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan)) * 100
+    return dx.rolling(n).mean()
+
+# ============ FETCH ============
+def _clean(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df.dropna()
+
+def fetch_m15():
+    print("Fetching M15 (60d)...")
+    df = _clean(yf.download("^NDX", period="60d", interval="15m",
+                            auto_adjust=False, progress=False))
+    df["EMA20"] = ema(df["Close"], EMA_FAST)
+    df["EMA50"] = ema(df["Close"], EMA_SLOW)
+    df["ATR14"] = atr(df, ATR_PERIOD)
+    df["ADX14"] = adx(df, ADX_PERIOD)
+    return df.dropna()
+
+def fetch_h1_trend():
+    """Ambil H1 dan hitung trend-nya."""
+    print("Fetching H1 (60d)...")
+    df = _clean(yf.download("^NDX", period="60d", interval="1h",
+                            auto_adjust=False, progress=False))
+    df["H1_EMA20"] = ema(df["Close"], 20)
+    df["H1_EMA50"] = ema(df["Close"], 50)
+    df["H1_trend"] = np.where(df["H1_EMA20"] > df["H1_EMA50"], "UP", "DOWN")
+    return df[["H1_trend"]]
+
+def align_h1_to_m15(m15, h1_trend):
+    """Copy trend H1 ke tiap candle M15 (ffill)."""
+    # Pastikan timezone sama
+    m15_copy = m15.copy()
+    h1_copy = h1_trend.copy()
+    if m15_copy.index.tz != h1_copy.index.tz:
+        h1_copy.index = h1_copy.index.tz_convert(m15_copy.index.tz)
+    m15_copy["H1_trend"] = h1_copy["H1_trend"].reindex(
+        m15_copy.index, method="ffill"
+    )
+    return m15_copy.dropna()
+
+# ============ KONFIRMASI CANDLE ============
+def is_bullish_engulfing(prev, curr):
+    return (prev["Close"] < prev["Open"] and
+            curr["Close"] > curr["Open"] and
+            curr["Close"] > prev["Open"] and
+            curr["Open"] < prev["Close"])
+
+def is_bearish_engulfing(prev, curr):
+    return (prev["Close"] > prev["Open"] and
+            curr["Close"] < curr["Open"] and
+            curr["Close"] < prev["Open"] and
+            curr["Open"] > prev["Close"])
+
+def is_bullish_pin(curr):
+    body = abs(curr["Close"] - curr["Open"])
+    rng = curr["High"] - curr["Low"]
+    if rng == 0: return False
+    lower_wick = min(curr["Open"], curr["Close"]) - curr["Low"]
+    return (lower_wick > 2 * body) and (body / rng < 0.35)
+
+def is_bearish_pin(curr):
+    body = abs(curr["Close"] - curr["Open"])
+    rng = curr["High"] - curr["Low"]
+    if rng == 0: return False
+    upper_wick = curr["High"] - max(curr["Open"], curr["Close"])
+    return (upper_wick > 2 * body) and (body / rng < 0.35)
+
+# ============ SIMULASI ============
+def simulate(df, i, direction, entry, sl, tp):
+    half_cost = COST / 2
+
+    if direction == "LONG":
+        entry_eff = entry + half_cost
+        sl_eff = sl - half_cost
+        tp_eff = tp - half_cost
+        risk = entry_eff - sl_eff
+        if risk <= 0: return None
+
+        for j in range(i + 1, min(i + 1 + MAX_HOLD_CANDLES, len(df))):
+            c = df.iloc[j]
+            if c["Low"] <= sl_eff:
+                return {"result": "LOSS", "R": -1.0, "exit_idx": j - i}
+            if c["High"] >= tp_eff:
+                return {"result": "WIN", "R": RR_TARGET, "exit_idx": j - i}
+
+        exit_idx = min(i + MAX_HOLD_CANDLES, len(df) - 1)
+        exit_p = df.iloc[exit_idx]["Close"]
+        r = (exit_p - entry_eff) / risk
+        return {"result": "TIMEOUT", "R": r, "exit_idx": MAX_HOLD_CANDLES}
+
+    else:
+        entry_eff = entry - half_cost
+        sl_eff = sl + half_cost
+        tp_eff = tp + half_cost
+        risk = sl_eff - entry_eff
+        if risk <= 0: return None
+
+        for j in range(i + 1, min(i + 1 + MAX_HOLD_CANDLES, len(df))):
+            c = df.iloc[j]
+            if c["High"] >= sl_eff:
+                return {"result": "LOSS", "R": -1.0, "exit_idx": j - i}
+            if c["Low"] <= tp_eff:
+                return {"result": "WIN", "R": RR_TARGET, "exit_idx": j - i}
+
+        exit_idx = min(i + MAX_HOLD_CANDLES, len(df) - 1)
+        exit_p = df.iloc[exit_idx]["Close"]
+        r = (entry_eff - exit_p) / risk
+        return {"result": "TIMEOUT", "R": r, "exit_idx": MAX_HOLD_CANDLES}
+
+# ============ CEK SETUP v2 ============
+def check_setup(df, i):
+    if i < SWING_LOOKBACK + 5:
+        return None
+
+    last = df.iloc[i]
+    prev = df.iloc[i - 1]
+
+    close = float(last["Close"])
+    ema20 = float(last["EMA20"])
+    ema50 = float(last["EMA50"])
+    atr_v = float(last["ATR14"])
+    adx_v = float(last["ADX14"]) if not pd.isna(last["ADX14"]) else 0
+    h1_trend = last.get("H1_trend", None)
+
+    # Filter 1: ADX
+    if adx_v < ADX_MIN:
+        return None
+
+    # Filter 2: jarak ke EMA
+    dist = abs(close - ema20)
+    if dist > MAX_DIST_ATR * atr_v:
+        return None
+
+    # LONG
+    if ema20 > ema50 and close > ema50:
+        # Filter 3: H1 harus UP
+        if h1_trend != "UP":
+            return None
+
+        touched = (prev["Low"] <= ema20 * 1.002 or prev["Low"] <= ema50 * 1.002)
+        confirm = close > ema20 and close > prev["Close"]
+        # Filter 4: candle confirm = engulfing atau pin bar
+        cand_ok = is_bullish_engulfing(prev, last) or is_bullish_pin(last)
+
+        if not (touched and confirm and cand_ok):
+            return None
+
+        recent = df.iloc[max(0, i - SWING_LOOKBACK):i + 1]
+        swing_low = float(recent["Low"].min())
+        sl = swing_low - 0.2 * atr_v
+        entry = ema20
+        risk = entry - sl
+        if risk <= 0 or risk > 3 * atr_v:
+            return None
+        tp = entry + RR_TARGET * risk
+        return {"direction": "LONG", "entry": entry, "sl": sl, "tp": tp,
+                "risk_pts": risk, "adx": adx_v, "h1_trend": h1_trend}
+
+    # SHORT
+    if ema20 < ema50 and close < ema50:
+        if h1_trend != "DOWN":
+            return None
+
+        touched = (prev["High"] >= ema20 * 0.998 or prev["High"] >= ema50 * 0.998)
+        confirm = close < ema20 and close < prev["Close"]
+        cand_ok = is_bearish_engulfing(prev, last) or is_bearish_pin(last)
+
+        if not (touched and confirm and cand_ok):
+            return None
+
+        recent = df.iloc[max(0, i - SWING_LOOKBACK):i + 1]
+        swing_high = float(recent["High"].max())
+        sl = swing_high + 0.2 * atr_v
+        entry = ema20
+        risk = sl - entry
+        if risk <= 0 or risk > 3 * atr_v:
+            return None
+        tp = entry - RR_TARGET * risk
+        return {"direction": "SHORT", "entry": entry, "sl": sl, "tp": tp,
+                "risk_pts": risk, "adx": adx_v, "h1_trend": h1_trend}
+
+    return None
+
+# ============ MAIN ============
+def run_backtest():
+    m15 = fetch_m15()
+    h1 = fetch_h1_trend()
+    df = align_h1_to_m15(m15, h1)
+
+    print(f"Data loaded: {len(df)} candles")
+    print(f"Period: {df.index[0]} → {df.index[-1]}")
+
+    trades = []
+    i = SWING_LOOKBACK + 5
+    while i < len(df) - MAX_HOLD_CANDLES - 1:
+        sig = check_setup(df, i)
+        if sig:
+            sim = simulate(df, i, sig["direction"], sig["entry"], sig["sl"], sig["tp"])
+            if sim:
+                trades.append({
+                    "datetime": str(df.index[i]),
+                    "direction": sig["direction"],
+                    "h1_trend": sig["h1_trend"],
+                    "adx": round(sig["adx"], 1),
+                    "entry": round(sig["entry"], 1),
+                    "sl": round(sig["sl"], 1),
+                    "tp": round(sig["tp"], 1),
+                    "risk_pts": round(sig["risk_pts"], 1),
+                    **sim
+                })
+                i += sim["exit_idx"] + 1
+                continue
+        i += 1
+
+    return pd.DataFrame(trades)
+
+# ============ METRIK ============
+def calc_metrics(tdf):
+    if len(tdf) == 0:
+        return "No trades triggered."
+
+    wins = tdf[tdf["R"] > 0]
+    losses = tdf[tdf["R"] < 0]
+    timeouts = tdf[tdf["result"] == "TIMEOUT"]
+
+    total_r = tdf["R"].sum()
+    win_rate = len(wins) / len(tdf) * 100
+    gross_win = wins["R"].sum() if len(wins) else 0
+    gross_loss = abs(losses["R"].sum()) if len(losses) else 0
+    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
+    avg_r = tdf["R"].mean()
+
+    equity = INITIAL_EQUITY
+    peak = equity
+    max_dd = 0
+    for _, t in tdf.iterrows():
+        equity += equity * RISK_PCT / 100 * t["R"]
+        if equity > peak: peak = equity
+        dd = (peak - equity) / peak * 100
+        if dd > max_dd: max_dd = dd
+
+    max_w = 0; max_l = 0; cw = 0; cl = 0
+    for _, t in tdf.iterrows():
+        if t["R"] > 0: cw += 1; cl = 0; max_w = max(max_w, cw)
+        elif t["R"] < 0: cl += 1; cw = 0; max_l = max(max_l, cl)
+        else: cw = 0; cl = 0
+
+    longs = tdf[tdf["direction"] == "LONG"]
+    shorts = tdf[tdf["direction"] ==
