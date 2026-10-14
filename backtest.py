@@ -8,12 +8,12 @@ from datetime import datetime
 # ============ CONFIG ============
 START_DATE = os.getenv("BT_START", "2015-01-01")
 END_DATE = os.getenv("BT_END", datetime.now().strftime("%Y-%m-%d"))
-SPREAD_POINTS = float(os.getenv("BT_SPREAD", "2.0"))     # spread USTEC Exness
-SLIPPAGE_POINTS = float(os.getenv("BT_SLIPPAGE", "1.0")) # slippage rata-rata
-RISK_PCT = float(os.getenv("BT_RISK", "0.5"))            # risk per trade %
+SPREAD_POINTS = float(os.getenv("BT_SPREAD", "2.0"))
+SLIPPAGE_POINTS = float(os.getenv("BT_SLIPPAGE", "1.0"))
+RISK_PCT = float(os.getenv("BT_RISK", "0.5"))
 INITIAL_EQUITY = float(os.getenv("BT_EQUITY", "10000"))
-MAX_HOLD_DAYS = 5                                        # max hold dalam hari
-COST_PER_TRADE = SPREAD_POINTS + SLIPPAGE_POINTS         # total biaya per round trip
+MAX_HOLD_DAYS = 5
+COST_PER_TRADE = SPREAD_POINTS + SLIPPAGE_POINTS
 
 # ============ INDIKATOR ============
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
@@ -59,76 +59,197 @@ def fetch_data():
     df["ADX14"]  = adx(df, 14)
     return df.dropna()
 
-# ============ LOGIKA SETUP ============
-def check_pullback_long(row, prev):
-    """Model A — Pullback Long"""
-    if (row["Close"] > row["EMA200"]
-        and row["EMA50"] > row["EMA200"]
-        and 40 <= row["RSI14"] <= 60
-        and row["Close"] > prev["High"]):
-        return True
-    return False
-
-def check_pullback_short(row, prev):
-    """Model A — Pullback Short"""
-    if (row["Close"] < row["EMA200"]
-        and row["EMA50"] < row["EMA200"]
-        and 40 <= row["RSI14"] <= 60
-        and row["Close"] < prev["Low"]):
-        return True
-    return False
-
 # ============ SIMULASI 1 TRADE ============
-def simulate_trade(df, i, direction, entry_price, sl, tp, risk):
-    """Cek hari-hari berikutnya, lihat TP atau SL kena dulu."""
-    # Biaya masuk (setengah spread + slippage)
+def simulate_trade(df, signal_idx, direction, entry, sl, tp1, tp2):
+    """
+    Simulasi trade dari signal_idx + 1 sampai MAX_HOLD_DAYS.
+    Aturan: 50% TP1, 50% TP2.
+    Kalau TP1 kena → SL geser ke breakeven (live bot rule).
+    """
     half_cost = COST_PER_TRADE / 2
 
     if direction == "LONG":
-        entry = entry_price + half_cost
+        entry_eff = entry + half_cost
         sl_eff = sl - half_cost
-        tp_eff = tp - half_cost
-        risk_eff = entry - sl_eff
+        tp1_eff = tp1 - half_cost
+        tp2_eff = tp2 - half_cost
+        risk = entry_eff - sl_eff
+        if risk <= 0: return None
 
-        for j in range(i + 1, min(i + 1 + MAX_HOLD_DAYS, len(df))):
+        tp1_hit = False
+        for j in range(signal_idx + 1, min(signal_idx + 1 + MAX_HOLD_DAYS, len(df))):
             day = df.iloc[j]
+
             # Cek SL dulu (konservatif)
-            if day["Low"] <= sl_eff:
-                return {"result": "LOSS", "R": -1.0, "exit_day": j - i,
-                        "exit_price": sl_eff}
-            if day["High"] >= tp_eff:
-                r = (tp_eff - entry) / risk_eff
-                return {"result": "WIN", "R": r, "exit_day": j - i,
-                        "exit_price": tp_eff}
+            # Kalau TP1 udah kena, SL = entry (breakeven)
+            sl_now = entry_eff if tp1_hit else sl_eff
+            if day["Low"] <= sl_now:
+                if tp1_hit:
+                    # 50% TP1 (+1.5R) + 50% breakeven (0R) = +0.75R total
+                    return {"result": "WIN_PARTIAL", "R": 0.75,
+                            "exit_day": j - signal_idx}
+                return {"result": "LOSS", "R": -1.0, "exit_day": j - signal_idx}
+
+            if not tp1_hit and day["High"] >= tp1_eff:
+                tp1_hit = True
+
+            if tp1_hit and day["High"] >= tp2_eff:
+                # 50% TP1 (+1.5R) + 50% TP2 (+2.5R) = +2.0R total
+                return {"result": "WIN_FULL", "R": 2.0, "exit_day": j - signal_idx}
 
         # Timeout
-        exit_day_idx = min(i + MAX_HOLD_DAYS, len(df) - 1)
-        exit_p = df.iloc[exit_day_idx]["Close"]
-        r = (exit_p - entry) / risk_eff
-        return {"result": "TIMEOUT", "R": r, "exit_day": MAX_HOLD_DAYS,
-                "exit_price": exit_p}
+        exit_idx = min(signal_idx + MAX_HOLD_DAYS, len(df) - 1)
+        exit_p = df.iloc[exit_idx]["Close"]
+        r_rem = (exit_p - entry_eff) / risk
+        if tp1_hit:
+            r_total = 0.5 * 1.5 + 0.5 * r_rem
+        else:
+            r_total = r_rem
+        return {"result": "TIMEOUT", "R": r_total, "exit_day": MAX_HOLD_DAYS}
 
     else:  # SHORT
-        entry = entry_price - half_cost
+        entry_eff = entry - half_cost
         sl_eff = sl + half_cost
-        tp_eff = tp + half_cost
-        risk_eff = sl_eff - entry
+        tp1_eff = tp1 + half_cost
+        tp2_eff = tp2 + half_cost
+        risk = sl_eff - entry_eff
+        if risk <= 0: return None
 
-        for j in range(i + 1, min(i + 1 + MAX_HOLD_DAYS, len(df))):
+        tp1_hit = False
+        for j in range(signal_idx + 1, min(signal_idx + 1 + MAX_HOLD_DAYS, len(df))):
             day = df.iloc[j]
-            if day["High"] >= sl_eff:
-                return {"result": "LOSS", "R": -1.0, "exit_day": j - i,
-                        "exit_price": sl_eff}
-            if day["Low"] <= tp_eff:
-                r = (entry - tp_eff) / risk_eff
-                return {"result": "WIN", "R": r, "exit_day": j - i,
-                        "exit_price": tp_eff}
+            sl_now = entry_eff if tp1_hit else sl_eff
 
-        exit_day_idx = min(i + MAX_HOLD_DAYS, len(df) - 1)
-        exit_p = df.iloc[exit_day_idx]["Close"]
-        r = (entry - exit_p) / risk_eff
-        return {"result": "TIMEOUT", "R": r, "exit_day": MAX_HOLD_DAYS,
-                "exit_price": exit_p}
+            if day["High"] >= sl_now:
+                if tp1_hit:
+                    return {"result": "WIN_PARTIAL", "R": 0.75,
+                            "exit_day": j - signal_idx}
+                return {"result": "LOSS", "R": -1.0, "exit_day": j - signal_idx}
+
+            if not tp1_hit and day["Low"] <= tp1_eff:
+                tp1_hit = True
+
+            if tp1_hit and day["Low"] <= tp2_eff:
+                return {"result": "WIN_FULL", "R": 2.0, "exit_day": j - signal_idx}
+
+        exit_idx = min(signal_idx + MAX_HOLD_DAYS, len(df) - 1)
+        exit_p = df.iloc[exit_idx]["Close"]
+        r_rem = (entry_eff - exit_p) / risk
+        if tp1_hit:
+            r_total = 0.5 * 1.5 + 0.5 * r_rem
+        else:
+            r_total = r_rem
+        return {"result": "TIMEOUT", "R": r_total, "exit_day": MAX_HOLD_DAYS}
+
+# ============ MODEL A: PULLBACK KE PDC ============
+def model_a_pullback(df, i):
+    """Entry di PDC hari ini, based on sinyal dari prev day."""
+    prev = df.iloc[i - 1]
+    today = df.iloc[i]
+
+    close_prev = prev["Close"]
+    pdc = prev["Close"]
+    pdh = prev["High"]
+    pdl = prev["Low"]
+    atr = prev["ATR14"]
+    rsi_v = prev["RSI14"]
+    adx_v = prev["ADX14"]
+    ema50 = prev["EMA50"]
+    ema200 = prev["EMA200"]
+
+    # Regime filter
+    if adx_v < 20:
+        return None
+
+    # === TREND UP → Pullback Long ===
+    if close_prev > ema200 and ema50 > ema200:
+        if not (40 <= rsi_v <= 60):
+            return None
+        # Cek: hari ini harga nyentuh PDC (pullback ke PDC)?
+        if not (today["Low"] <= pdc <= today["High"]):
+            return None
+        entry = pdc
+        sl = pdl - atr * 0.5
+        risk = entry - sl
+        if risk <= 0 or risk > atr * 2:
+            return None
+        tp1 = entry + 1.5 * risk
+        tp2 = entry + 2.5 * risk
+        return {"direction": "LONG", "entry": entry, "sl": sl,
+                "tp1": tp1, "tp2": tp2, "model": "A_LONG"}
+
+    # === TREND DOWN → Pullback Short ===
+    if close_prev < ema200 and ema50 < ema200:
+        if not (40 <= rsi_v <= 60):
+            return None
+        if not (today["Low"] <= pdc <= today["High"]):
+            return None
+        entry = pdc
+        sl = pdh + atr * 0.5
+        risk = sl - entry
+        if risk <= 0 or risk > atr * 2:
+            return None
+        tp1 = entry - 1.5 * risk
+        tp2 = entry - 2.5 * risk
+        return {"direction": "SHORT", "entry": entry, "sl": sl,
+                "tp1": tp1, "tp2": tp2, "model": "A_SHORT"}
+
+    return None
+
+# ============ MODEL B: ORB BREAKOUT PDH/PDL ============
+def model_b_orb(df, i):
+    """ORB: break PDH (uptrend) atau PDL (downtrend)."""
+    prev = df.iloc[i - 1]
+    today = df.iloc[i]
+
+    close_prev = prev["Close"]
+    pdh = prev["High"]
+    pdl = prev["Low"]
+    pdc = prev["Close"]
+    atr = prev["ATR14"]
+    adx_v = prev["ADX14"]
+    ema50 = prev["EMA50"]
+    ema200 = prev["EMA200"]
+
+    # Pivot & R1/S1
+    pivot = (pdh + pdl + pdc) / 3
+    r1 = 2 * pivot - pdl
+    s1 = 2 * pivot - pdh
+
+    if adx_v < 20:
+        return None
+
+    # === TREND UP → Breakout Long ===
+    if close_prev > ema200 and ema50 > ema200:
+        if today["High"] >= pdh:
+            entry = pdh
+            sl = pdc
+            risk = entry - sl
+            if risk <= 0 or risk > atr * 2:
+                return None
+            tp1 = r1
+            tp2 = pdh + atr
+            if tp1 <= entry:  # TP harus di atas entry
+                tp1 = entry + 1.5 * risk
+            return {"direction": "LONG", "entry": entry, "sl": sl,
+                    "tp1": tp1, "tp2": tp2, "model": "B_LONG"}
+
+    # === TREND DOWN → Breakdown Short ===
+    if close_prev < ema200 and ema50 < ema200:
+        if today["Low"] <= pdl:
+            entry = pdl
+            sl = pdc
+            risk = sl - entry
+            if risk <= 0 or risk > atr * 2:
+                return None
+            tp1 = s1
+            tp2 = pdl - atr
+            if tp1 >= entry:
+                tp1 = entry - 1.5 * risk
+            return {"direction": "SHORT", "entry": entry, "sl": sl,
+                    "tp1": tp1, "tp2": tp2, "model": "B_SHORT"}
+
+    return None
 
 # ============ MAIN BACKTEST ============
 def run_backtest():
@@ -136,48 +257,36 @@ def run_backtest():
     print(f"Data loaded: {len(df)} candles")
 
     trades = []
+    for i in range(201, len(df) - MAX_HOLD_DAYS - 1):
+        # Max 2 trade/hari, prioritas Model A
+        signals = []
 
-    for i in range(200, len(df) - MAX_HOLD_DAYS - 1):
-        row = df.iloc[i]
-        prev = df.iloc[i - 1]
-        atr = row["ATR14"]
+        sig_a = model_a_pullback(df, i)
+        if sig_a:
+            signals.append(sig_a)
 
-        # ===== Model A — Pullback Long =====
-        if check_pullback_long(row, prev):
-            entry = row["Close"]
-            sl = min(row["Low"], row["EMA50"]) - atr * 0.5
-            risk = entry - sl
-            if risk <= 0 or risk > atr * 3:
+        sig_b = model_b_orb(df, i)
+        if sig_b:
+            signals.append(sig_b)
+
+        # Prioritas Model A, max 1 trade per hari (biar konservatif)
+        # Kalau lu mau 2 trade/hari, ubah jadi signals[:2]
+        selected = signals[:1]
+
+        for sig in selected:
+            sim = simulate_trade(df, i, sig["direction"],
+                                 sig["entry"], sig["sl"],
+                                 sig["tp1"], sig["tp2"])
+            if sim is None:
                 continue
-            tp = entry + 1.5 * risk
-
-            sim = simulate_trade(df, i, "LONG", entry, sl, tp, risk)
             trades.append({
-                "date": str(row.name)[:10],
-                "model": "A_LONG",
-                "entry": round(entry, 1),
-                "sl": round(sl, 1),
-                "tp": round(tp, 1),
-                **sim
-            })
-            continue
-
-        # ===== Model A — Pullback Short =====
-        if check_pullback_short(row, prev):
-            entry = row["Close"]
-            sl = max(row["High"], row["EMA50"]) + atr * 0.5
-            risk = sl - entry
-            if risk <= 0 or risk > atr * 3:
-                continue
-            tp = entry - 1.5 * risk
-
-            sim = simulate_trade(df, i, "SHORT", entry, sl, tp, risk)
-            trades.append({
-                "date": str(row.name)[:10],
-                "model": "A_SHORT",
-                "entry": round(entry, 1),
-                "sl": round(sl, 1),
-                "tp": round(tp, 1),
+                "date": str(df.iloc[i].name)[:10],
+                "model": sig["model"],
+                "direction": sig["direction"],
+                "entry": round(sig["entry"], 1),
+                "sl": round(sig["sl"], 1),
+                "tp1": round(sig["tp1"], 1),
+                "tp2": round(sig["tp2"], 1),
                 **sim
             })
 
@@ -198,10 +307,8 @@ def calc_metrics(tdf):
     gross_loss = abs(losses["R"].sum()) if len(losses) else 0
     pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
     avg_r = tdf["R"].mean()
-    avg_win = wins["R"].mean() if len(wins) else 0
-    avg_loss = losses["R"].mean() if len(losses) else 0
 
-    # Equity curve + max drawdown
+    # Equity curve
     equity = INITIAL_EQUITY
     peak = equity
     max_dd = 0
@@ -224,120 +331,116 @@ def calc_metrics(tdf):
                 max_dd_end = t["date"]
 
     # Streak
-    max_win_streak = 0
-    max_loss_streak = 0
-    cur_w = 0
-    cur_l = 0
+    max_win_streak = 0; max_loss_streak = 0
+    cur_w = 0; cur_l = 0
     for _, t in tdf.iterrows():
         if t["R"] > 0:
-            cur_w += 1
-            cur_l = 0
+            cur_w += 1; cur_l = 0
             max_win_streak = max(max_win_streak, cur_w)
         elif t["R"] < 0:
-            cur_l += 1
-            cur_w = 0
+            cur_l += 1; cur_w = 0
             max_loss_streak = max(max_loss_streak, cur_l)
         else:
-            cur_w = 0
-            cur_l = 0
+            cur_w = 0; cur_l = 0
 
-    # Yearly breakdown
-    tdf["year"] = tdf["date"].str[:4]
-    yearly = tdf.groupby("year").agg(
+    # Breakdown by model
+    by_model = tdf.groupby("model").agg(
+        trades=("R", "count"),
+        total_r=("R", "sum"),
+        avg_r=("R", "mean"),
+        win_rate=("R", lambda x: (x > 0).mean() * 100)
+    ).round(2)
+
+    # Yearly
+    tdf_copy = tdf.copy()
+    tdf_copy["year"] = tdf_copy["date"].str[:4]
+    yearly = tdf_copy.groupby("year").agg(
         trades=("R", "count"),
         total_r=("R", "sum"),
         win_rate=("R", lambda x: (x > 0).mean() * 100)
     ).round(2)
 
-    report = []
-    report.append("=" * 50)
-    report.append("  US100 BACKTEST RESULT")
-    report.append("=" * 50)
-    report.append(f"Period          : {tdf['date'].iloc[0]} → {tdf['date'].iloc[-1]}")
-    report.append(f"Risk / trade    : {RISK_PCT}%")
-    report.append(f"Initial equity  : ${INITIAL_EQUITY:,.0f}")
-    report.append(f"Biaya / trade   : {COST_PER_TRADE:.1f} poin (spread+slip)")
-    report.append("-" * 50)
-    report.append(f"Total trades    : {len(tdf)}")
-    report.append(f"  Wins          : {len(wins)}")
-    report.append(f"  Losses        : {len(losses)}")
-    report.append(f"  Timeouts      : {len(timeouts)}")
-    report.append(f"Win rate        : {win_rate:.1f}%")
-    report.append(f"Avg win         : {avg_win:+.2f} R")
-    report.append(f"Avg loss        : {avg_loss:+.2f} R")
-    report.append("-" * 50)
-    report.append(f"Total R         : {total_r:+.2f}")
-    report.append(f"Avg R / trade   : {avg_r:+.3f}")
-    report.append(f"Profit Factor   : {pf:.2f}")
-    report.append(f"Expectancy      : {avg_r:+.3f} R")
-    report.append("-" * 50)
-    report.append(f"Final equity    : ${equity:,.2f}")
-    report.append(f"Total return    : {(equity - INITIAL_EQUITY)/INITIAL_EQUITY*100:+.1f}%")
-    report.append(f"Max drawdown    : {max_dd:.1f}%")
+    r = []
+    r.append("=" * 55)
+    r.append("  US100 BACKTEST — LIVE BOT MATCH")
+    r.append("=" * 55)
+    r.append(f"Period          : {tdf['date'].iloc[0]} → {tdf['date'].iloc[-1]}")
+    r.append(f"Risk / trade    : {RISK_PCT}%")
+    r.append(f"Initial equity  : ${INITIAL_EQUITY:,.0f}")
+    r.append(f"Biaya / trade   : {COST_PER_TRADE:.1f} poin")
+    r.append("-" * 55)
+    r.append(f"Total trades    : {len(tdf)}")
+    r.append(f"  Wins          : {len(wins)}")
+    r.append(f"  Losses        : {len(losses)}")
+    r.append(f"  Timeouts      : {len(timeouts)}")
+    r.append(f"Win rate        : {win_rate:.1f}%")
+    r.append("-" * 55)
+    r.append(f"Total R         : {total_r:+.2f}")
+    r.append(f"Avg R / trade   : {avg_r:+.3f}")
+    r.append(f"Profit Factor   : {pf:.2f}")
+    r.append("-" * 55)
+    r.append(f"Final equity    : ${equity:,.2f}")
+    r.append(f"Total return    : {(equity - INITIAL_EQUITY)/INITIAL_EQUITY*100:+.1f}%")
+    r.append(f"Max drawdown    : {max_dd:.1f}%")
     if max_dd_start:
-        report.append(f"  DD period     : {max_dd_start} → {max_dd_end}")
-    report.append(f"Max win streak  : {max_win_streak}")
-    report.append(f"Max loss streak : {max_loss_streak}")
-    report.append("-" * 50)
-    report.append("")
-    report.append("YEARLY BREAKDOWN")
-    report.append("-" * 50)
-    report.append(yearly.to_string())
-    report.append("")
-    report.append("=" * 50)
-    report.append("LAST 10 TRADES")
-    report.append("-" * 50)
-    report.append(tdf.tail(10).to_string(index=False))
-    report.append("=" * 50)
+        r.append(f"  DD period     : {max_dd_start} → {max_dd_end}")
+    r.append(f"Max win streak  : {max_win_streak}")
+    r.append(f"Max loss streak : {max_loss_streak}")
+    r.append("-" * 55)
+    r.append("")
+    r.append("BREAKDOWN BY MODEL")
+    r.append("-" * 55)
+    r.append(by_model.to_string())
+    r.append("")
+    r.append("YEARLY")
+    r.append("-" * 55)
+    r.append(yearly.to_string())
+    r.append("")
+    r.append("=" * 55)
+    r.append("LAST 10 TRADES")
+    r.append("-" * 55)
+    r.append(tdf.tail(10).to_string(index=False))
+    r.append("=" * 55)
 
-    # Verdict
-    report.append("")
+    r.append("")
     if pf >= 1.5:
-        report.append("✅ VERDICT: Strategi LAYAK dipakai (PF >= 1.5)")
+        r.append("✅ VERDICT: LAYAK (PF >= 1.5)")
     elif pf >= 1.3:
-        report.append("⚠️  VERDICT: Strategi OK tapi perlu optimasi (PF 1.3-1.5)")
+        r.append("⚠️  VERDICT: OK, perlu optimasi (PF 1.3-1.5)")
     elif pf >= 1.0:
-        report.append("⚠️  VERDICT: Marginal, jangan naikin lot dulu (PF 1.0-1.3)")
+        r.append("⚠️  VERDICT: Marginal (PF 1.0-1.3)")
     else:
-        report.append("❌ VERDICT: JANGAN live trading. Strategi rugi (PF < 1.0)")
+        r.append("❌ VERDICT: JANGAN LIVE (PF < 1.0)")
 
-    return "\n".join(report)
+    return "\n".join(r)
 
-# ============ KIRIM TELEGRAM (OPSIONAL) ============
+# ============ TELEGRAM ============
 def send_telegram(text):
     token = os.getenv("TELEGRAM_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("(Telegram skip: token/chat_id tidak ada)")
+        print("(Telegram skip)")
         return
-    # Telegram max 4096 char per message
-    max_len = 4000
+    max_len = 3800
     chunks = [text[i:i+max_len] for i in range(0, len(text), max_len)]
-    for chunk in chunks:
+    for c in chunks:
         try:
             requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                data={"chat_id": chat_id, "text": f"```\n{chunk}\n```",
+                data={"chat_id": chat_id, "text": f"```\n{c}\n```",
                       "parse_mode": "Markdown"},
                 timeout=30
             )
         except Exception as e:
-            print(f"Telegram error: {e}")
+            print(f"Telegram err: {e}")
 
 # ============ RUN ============
 if __name__ == "__main__":
-    print("=" * 50)
     print("Starting backtest...")
-    print("=" * 50)
-
     tdf = run_backtest()
     report = calc_metrics(tdf)
-
     print(report)
-
-    # Simpan CSV juga
     if len(tdf) > 0:
         tdf.to_csv("backtest_trades.csv", index=False)
-        print("\n📁 Trade list saved to backtest_trades.csv")
-
+        print("\n📁 backtest_trades.csv saved")
     send_telegram(report)
