@@ -1,6 +1,6 @@
+python-telegram-bot
 yfinance
-   pandas
-   pandas-ta
-   groq
-   requests
-   pytz
+pandas
+pandas-ta
+groq
+pytz
